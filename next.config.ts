@@ -7,6 +7,10 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  // Force rebuild - cache buster: v3
+  experimental: {
+    // Invalidate cache
+  },
 };
 
 export default nextConfig;
