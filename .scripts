@@ -1,1 +1,514 @@
 
+#!/bin/bash
+
+# 将 stderr 重定向到 stdout，避免 execute_command 因为 stderr 输出而报错
+exec 2>&1
+
+set -e
+
+# 获取脚本所在目录（.zscripts 目录，即 workspace-agent/.zscripts）
+# 使用 $0 获取脚本路径（兼容 sh 和 bash）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Next.js 项目路径
+NEXTJS_PROJECT_DIR="/home/z/my-project"
+
+# 检查 Next.js 项目目录是否存在
+if [ ! -d "$NEXTJS_PROJECT_DIR" ]; then
+    echo "❌ 错误: Next.js 项目目录不存在: $NEXTJS_PROJECT_DIR"
+    exit 1
+fi
+
+echo "🚀 开始构建 Next.js 应用和 mini-services..."
+echo "📁 Next.js 项目路径: $NEXTJS_PROJECT_DIR"
+
+# 切换到 Next.js 项目目录
+cd "$NEXTJS_PROJECT_DIR" || exit 1
+
+# 设置环境变量
+export NEXT_TELEMETRY_DISABLED=1
+
+BUILD_DIR="/tmp/build_fullstack_$BUILD_ID"
+echo "📁 清理并创建构建目录: $BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+# 安装依赖
+echo "📦 安装依赖..."
+bun install
+
+# 构建 Next.js 应用
+echo "🔨 构建 Next.js 应用..."
+bun run build
+
+# 构建 mini-services
+# 检查 Next.js 项目目录下是否有 mini-services 目录
+if [ -d "$NEXTJS_PROJECT_DIR/mini-services" ]; then
+    echo "🔨 构建 mini-services..."
+    # 使用 workspace-agent 目录下的 mini-services 脚本
+    sh "$SCRIPT_DIR/mini-services-install.sh"
+    sh "$SCRIPT_DIR/mini-services-build.sh"
+
+    # 复制 mini-services-start.sh 到 mini-services-dist 目录
+    echo "  - 复制 mini-services-start.sh 到 $BUILD_DIR"
+    cp "$SCRIPT_DIR/mini-services-start.sh" "$BUILD_DIR/mini-services-start.sh"
+    chmod +x "$BUILD_DIR/mini-services-start.sh"
+else
+    echo "ℹ️  mini-services 目录不存在，跳过"
+fi
+
+# 将所有构建产物复制到临时构建目录
+echo "📦 收集构建产物到 $BUILD_DIR..."
+
+# 复制 Next.js standalone 构建输出
+if [ -d ".next/standalone" ]; then
+    echo "  - 复制 .next/standalone"
+    cp -r .next/standalone "$BUILD_DIR/next-service-dist/"
+fi
+
+# 复制 Next.js 静态文件
+if [ -d ".next/static" ]; then
+    echo "  - 复制 .next/static"
+    mkdir -p "$BUILD_DIR/next-service-dist/.next"
+    cp -r .next/static "$BUILD_DIR/next-service-dist/.next/"
+fi
+
+# 复制 public 目录
+if [ -d "public" ]; then
+    echo "  - 复制 public"
+    cp -r public "$BUILD_DIR/next-service-dist/"
+fi
+
+# 最后再迁移数据库到 BUILD_DIR/db
+if [ "$(ls -A ./db 2>/dev/null)" ]; then
+    echo "🗄️  检测到数据库文件，运行数据库迁移..."
+    DATABASE_URL=file:$BUILD_DIR/db/custom.db bun run db:push
+    echo "✅ 数据库迁移完成"
+    ls -lah $BUILD_DIR/db
+else
+    echo "ℹ️  db 目录为空，跳过数据库迁移"
+fi
+
+# 复制 Caddyfile（如果存在）
+if [ -f "Caddyfile" ]; then
+    echo "  - 复制 Caddyfile"
+    cp Caddyfile "$BUILD_DIR/"
+else
+    echo "ℹ️  Caddyfile 不存在，跳过"
+fi
+
+# 复制 start.sh 脚本
+echo "  - 复制 start.sh 到 $BUILD_DIR"
+cp "$SCRIPT_DIR/start.sh" "$BUILD_DIR/start.sh"
+chmod +x "$BUILD_DIR/start.sh"
+
+# 打包到 $BUILD_DIR.tar.gz
+PACKAGE_FILE="${BUILD_DIR}.tar.gz"
+echo ""
+echo "📦 打包构建产物到 $PACKAGE_FILE..."
+cd "$BUILD_DIR" || exit 1
+tar -czf "$PACKAGE_FILE" .
+cd - > /dev/null || exit 1
+
+# # 清理临时目录
+# rm -rf "$BUILD_DIR"
+
+echo ""
+echo "✅ 构建完成！所有产物已打包到 $PACKAGE_FILE"
+echo "📊 打包文件大小:"
+ls -lh "$PACKAGE_FILE"
+
+#!/bin/bash
+
+# 配置项
+ROOT_DIR="/home/z/my-project/mini-services"
+DIST_DIR="/tmp/build_fullstack_$BUILD_ID/mini-services-dist"
+
+main() {
+    echo "🚀 开始批量构建..."
+    
+    # 检查 rootdir 是否存在
+    if [ ! -d "$ROOT_DIR" ]; then
+        echo "ℹ️  目录 $ROOT_DIR 不存在，跳过构建"
+        return
+    fi
+    
+    # 创建输出目录（如果不存在）
+    mkdir -p "$DIST_DIR"
+    
+    # 统计变量
+    success_count=0
+    fail_count=0
+    
+    # 遍历 mini-services 目录下的所有文件夹
+    for dir in "$ROOT_DIR"/*; do
+        # 检查是否是目录且包含 package.json
+        if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+            project_name=$(basename "$dir")
+            
+            # 智能查找入口文件 (按优先级查找)
+            entry_path=""
+            for entry in "src/index.ts" "index.ts" "src/index.js" "index.js"; do
+                if [ -f "$dir/$entry" ]; then
+                    entry_path="$dir/$entry"
+                    break
+                fi
+            done
+            
+            if [ -z "$entry_path" ]; then
+                echo "⚠️  跳过 $project_name: 未找到入口文件 (index.ts/js)"
+                continue
+            fi
+            
+            echo ""
+            echo "📦 正在构建: $project_name..."
+            
+            # 使用 bun build CLI 构建
+            output_file="$DIST_DIR/mini-service-$project_name.js"
+            
+            if bun build "$entry_path" \
+                --outfile "$output_file" \
+                --target bun \
+                --minify; then
+                echo "✅ $project_name 构建成功 -> $output_file"
+                success_count=$((success_count + 1))
+            else
+                echo "❌ $project_name 构建失败"
+                fail_count=$((fail_count + 1))
+            fi
+        fi
+    done
+    
+    if [ -f ./.zscripts/mini-services-start.sh ]; then
+        cp ./.zscripts/mini-services-start.sh "$DIST_DIR/mini-services-start.sh"
+        chmod +x "$DIST_DIR/mini-services-start.sh"
+    fi
+    
+    echo ""
+    echo "🎉 所有任务完成！"
+    if [ $success_count -gt 0 ] || [ $fail_count -gt 0 ]; then
+        echo "✅ 成功: $success_count 个"
+        if [ $fail_count -gt 0 ]; then
+            echo "❌ 失败: $fail_count 个"
+        fi
+    fi
+}
+
+main
+
+
+#!/bin/bash
+
+# 配置项
+ROOT_DIR="/home/z/my-project/mini-services"
+
+main() {
+    echo "🚀 开始批量安装依赖..."
+    
+    # 检查 rootdir 是否存在
+    if [ ! -d "$ROOT_DIR" ]; then
+        echo "ℹ️  目录 $ROOT_DIR 不存在，跳过安装"
+        return
+    fi
+    
+    # 统计变量
+    success_count=0
+    fail_count=0
+    failed_projects=""
+    
+    # 遍历 mini-services 目录下的所有文件夹
+    for dir in "$ROOT_DIR"/*; do
+        # 检查是否是目录且包含 package.json
+        if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+            project_name=$(basename "$dir")
+            echo ""
+            echo "📦 正在安装依赖: $project_name..."
+            
+            # 进入项目目录并执行 bun install
+            if (cd "$dir" && bun install); then
+                echo "✅ $project_name 依赖安装成功"
+                success_count=$((success_count + 1))
+            else
+                echo "❌ $project_name 依赖安装失败"
+                fail_count=$((fail_count + 1))
+                if [ -z "$failed_projects" ]; then
+                    failed_projects="$project_name"
+                else
+                    failed_projects="$failed_projects $project_name"
+                fi
+            fi
+        fi
+    done
+    
+    # 汇总结果
+    echo ""
+    echo "=================================================="
+    if [ $success_count -gt 0 ] || [ $fail_count -gt 0 ]; then
+        echo "🎉 安装完成！"
+        echo "✅ 成功: $success_count 个"
+        if [ $fail_count -gt 0 ]; then
+            echo "❌ 失败: $fail_count 个"
+            echo ""
+            echo "失败的项目:"
+            for project in $failed_projects; do
+                echo "  - $project"
+            done
+        fi
+    else
+        echo "ℹ️  未找到任何包含 package.json 的项目"
+    fi
+    echo "=================================================="
+}
+
+main
+
+
+#!/bin/sh
+
+# 配置项
+DIST_DIR="./mini-services-dist"
+
+# 存储所有子进程的 PID
+pids=""
+
+# 清理函数：优雅关闭所有服务
+cleanup() {
+    echo ""
+    echo "🛑 正在关闭所有服务..."
+    
+    # 发送 SIGTERM 信号给所有子进程
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            service_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            echo "   关闭进程 $pid ($service_name)..."
+            kill -TERM "$pid" 2>/dev/null
+        fi
+    done
+    
+    # 等待所有进程退出（最多等待 5 秒）
+    sleep 1
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            # 如果还在运行，等待最多 4 秒
+            timeout=4
+            while [ $timeout -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                timeout=$((timeout - 1))
+            done
+            # 如果仍然在运行，强制关闭
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "   强制关闭进程 $pid..."
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
+    
+    echo "✅ 所有服务已关闭"
+}
+
+main() {
+    echo "🚀 开始启动所有 mini services..."
+    
+    # 检查 dist 目录是否存在
+    if [ ! -d "$DIST_DIR" ]; then
+        echo "ℹ️  目录 $DIST_DIR 不存在"
+        return
+    fi
+    
+    # 查找所有 mini-service-*.js 文件
+    service_files=""
+    for file in "$DIST_DIR"/mini-service-*.js; do
+        if [ -f "$file" ]; then
+            if [ -z "$service_files" ]; then
+                service_files="$file"
+            else
+                service_files="$service_files $file"
+            fi
+        fi
+    done
+    
+    # 计算服务文件数量
+    service_count=0
+    for file in $service_files; do
+        service_count=$((service_count + 1))
+    done
+    
+    if [ $service_count -eq 0 ]; then
+        echo "ℹ️  未找到任何 mini service 文件"
+        return
+    fi
+    
+    echo "📦 找到 $service_count 个服务，开始启动..."
+    echo ""
+    
+    # 启动每个服务
+    for file in $service_files; do
+        service_name=$(basename "$file" .js | sed 's/mini-service-//')
+        echo "▶️  启动服务: $service_name..."
+        
+        # 使用 bun 运行服务（后台运行）
+        bun "$file" &
+        pid=$!
+        if [ -z "$pids" ]; then
+            pids="$pid"
+        else
+            pids="$pids $pid"
+        fi
+        
+        # 等待一小段时间检查进程是否成功启动
+        sleep 0.5
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "❌ $service_name 启动失败"
+            # 从字符串中移除失败的 PID
+            pids=$(echo "$pids" | sed "s/\b$pid\b//" | sed 's/  */ /g' | sed 's/^ *//' | sed 's/ *$//')
+        else
+            echo "✅ $service_name 已启动 (PID: $pid)"
+        fi
+    done
+    
+    # 计算运行中的服务数量
+    running_count=0
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            running_count=$((running_count + 1))
+        fi
+    done
+    
+    echo ""
+    echo "🎉 所有服务已启动！共 $running_count 个服务正在运行"
+    echo ""
+    echo "💡 按 Ctrl+C 停止所有服务"
+    echo ""
+    
+    # 等待所有后台进程
+    wait
+}
+
+main
+
+
+#!/bin/sh
+
+set -e
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR"
+
+# 存储所有子进程的 PID
+pids=""
+
+# 清理函数：优雅关闭所有服务
+cleanup() {
+    echo ""
+    echo "🛑 正在关闭所有服务..."
+    
+    # 发送 SIGTERM 信号给所有子进程
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            service_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            echo "   关闭进程 $pid ($service_name)..."
+            kill -TERM "$pid" 2>/dev/null
+        fi
+    done
+    
+    # 等待所有进程退出（最多等待 5 秒）
+    sleep 1
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+            # 如果还在运行，等待最多 4 秒
+            timeout=4
+            while [ $timeout -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                timeout=$((timeout - 1))
+            done
+            # 如果仍然在运行，强制关闭
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "   强制关闭进程 $pid..."
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
+    
+    echo "✅ 所有服务已关闭"
+    exit 0
+}
+
+echo "🚀 开始启动所有服务..."
+echo ""
+
+# 切换到构建目录
+cd "$BUILD_DIR" || exit 1
+
+ls -lah
+
+# 初始化数据库（如果存在）
+if [ -d "./next-service-dist/db" ] && [ "$(ls -A ./next-service-dist/db 2>/dev/null)" ] && [ -d "/db" ]; then
+    echo "🗄️  初始化数据库从 ./next-service-dist/db 到 /db..."
+    cp -r ./next-service-dist/db/* /db/ 2>/dev/null || echo "  ⚠️  无法复制到 /db，跳过数据库初始化"
+    echo "✅ 数据库初始化完成"
+fi
+
+# 启动 Next.js 服务器
+if [ -f "./next-service-dist/server.js" ]; then
+    echo "🚀 启动 Next.js 服务器..."
+    cd next-service-dist/ || exit 1
+    
+    # 设置环境变量
+    export NODE_ENV=production
+    export PORT=${PORT:-3000}
+    export HOSTNAME=${HOSTNAME:-0.0.0.0}
+    
+    # 后台启动 Next.js
+    bun server.js &
+    NEXT_PID=$!
+    pids="$NEXT_PID"
+    
+    # 等待一小段时间检查进程是否成功启动
+    sleep 1
+    if ! kill -0 "$NEXT_PID" 2>/dev/null; then
+        echo "❌ Next.js 服务器启动失败"
+        exit 1
+    else
+        echo "✅ Next.js 服务器已启动 (PID: $NEXT_PID, Port: $PORT)"
+    fi
+    
+    cd ../
+else
+    echo "⚠️  未找到 Next.js 服务器文件: ./next-service-dist/server.js"
+fi
+
+# 启动 mini-services
+if [ -f "./mini-services-start.sh" ]; then
+    echo "🚀 启动 mini-services..."
+    
+    # 运行启动脚本（从根目录运行，脚本内部会处理 mini-services-dist 目录）
+    sh ./mini-services-start.sh &
+    MINI_PID=$!
+    pids="$pids $MINI_PID"
+    
+    # 等待一小段时间检查进程是否成功启动
+    sleep 1
+    if ! kill -0 "$MINI_PID" 2>/dev/null; then
+        echo "⚠️  mini-services 可能启动失败，但继续运行..."
+    else
+        echo "✅ mini-services 已启动 (PID: $MINI_PID)"
+    fi
+elif [ -d "./mini-services-dist" ]; then
+    echo "⚠️  未找到 mini-services 启动脚本，但目录存在"
+else
+    echo "ℹ️  mini-services 目录不存在，跳过"
+fi
+
+# 启动 Caddy（如果存在 Caddyfile）
+echo "🚀 启动 Caddy..."
+
+# Caddy 作为前台进程运行（主进程）
+echo "✅ Caddy 已启动（前台运行）"
+echo ""
+echo "🎉 所有服务已启动！"
+echo ""
+echo "💡 按 Ctrl+C 停止所有服务"
+echo ""
+
+# Caddy 作为主进程运行
+exec caddy run --config Caddyfile --adapter caddyfile
